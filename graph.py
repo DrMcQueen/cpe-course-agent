@@ -4,11 +4,17 @@
 # Ingestion logic lives in ingest.py and is imported, keeping document
 # preparation separate from orchestration.
 
+
+# ============================================================================
+# IMPORTS & SETUP
+# ============================================================================
 import time
 from typing import TypedDict
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
 from ingest import extract_text, chunk_text
+from validator import validate
+from langgraph.graph import StateGraph, START, END
 
 # Loads the API key from .env into the environment before any model call.
 load_dotenv()
@@ -28,6 +34,13 @@ class CourseState(TypedDict):
     content: str            # filled by CONTENT: the written instructional material
     assessment: str         # filled by ASSESSMENT: the quiz questions
 
+    # --- Loop control, added for the validation cycle ---
+    failures: list[str]     # filled by VALIDATE: rule failures from the last run,
+                            # empty list means the output passed. This is what the
+                            # conditional edge reads to decide pass vs regenerate.
+    attempts: int           # incremented each time the pipeline runs. The loop
+                            # escalates to a human when this hits the retry cap,
+                            # distinguishing systematic failure from transient.
 
 # One shared model instance for every node. Flash Lite, chosen for the free
 # tier's 500 requests/day allowance (the stronger Flash models cap at 20/day,
@@ -163,32 +176,154 @@ def assessment_node(state: CourseState) -> dict:
 
     return {"assessment": response.text}
 
-# Test Harness
+def validate_node(state: CourseState) -> dict:
+    """VALIDATE: run the rule-based validator and record the result in state.
+
+    This node does not judge anything itself. It calls the validator (built and
+    tested separately in validator.py) and writes two things into state:
+    the list of failures (empty means passed) and an incremented attempt count.
+
+    The conditional edge downstream reads these two fields to decide whether to
+    finish, regenerate, or escalate. Keeping the decision OUT of this node and
+    IN the edge is deliberate: the node's job is to produce the verdict, the
+    edge's job is to act on it. Separating "assess" from "route on the
+    assessment" keeps each piece simple and independently understandable.
+    """
+    failures = validate(
+        state["objectives"],
+        state["outline"],
+        state["assessment"],
+    )
+
+    # attempts may not be set on the first pass; default to 0 then add 1.
+    # This counter is what bounds the loop and triggers human escalation.
+    current_attempts = state.get("attempts", 0) + 1
+
+    # Log to the console so a human watching the run sees the verdict live.
+    # This is the auditable trail: every validation pass prints its outcome.
+    if failures:
+        print(f"\n[VALIDATE] Attempt {current_attempts}: FAILED with {len(failures)} issue(s):")
+        for f in failures:
+            print(f"    - {f}")
+    else:
+        print(f"\n[VALIDATE] Attempt {current_attempts}: PASSED all checks.")
+
+    return {"failures": failures, "attempts": current_attempts}
+
+# ============================================================================
+# ROUTING / CONDITIONAL EDGE LOGIC
+# Reads validation result from state and returns a direction: pass, escalate
+# (retry cap hit, hand to human), or regenerate (loop back). Decision only.
+# ============================================================================
+MAX_ATTEMPTS = 3
+
+
+def route_after_validation(state: CourseState) -> str:
+    """Decide what happens after validation. Returns the name of the next step.
+
+    This is the conditional edge's decision function. It does not act; it only
+    chooses a direction by returning a string that the graph maps to a node
+    (or to END). Three outcomes:
+
+    - "pass": no failures. Finish.
+    - "escalate": failures remain but the retry cap is hit. This is systematic
+      failure, retrying will not help, so finish and leave the failures in state
+      for a human to diagnose. This is the human-in-the-loop escalation.
+    - "regenerate": failures exist and attempts remain. Loop back and rerun.
+    """
+    if not state["failures"]:
+        return "pass"
+    if state["attempts"] >= MAX_ATTEMPTS:
+        print(
+            f"\n[ROUTER] Hit {MAX_ATTEMPTS}-attempt cap with failures remaining. "
+            f"Escalating to human review."
+        )
+        return "escalate"
+    print(f"\n[ROUTER] Validation failed, regenerating (attempt {state['attempts']} of {MAX_ATTEMPTS}).")
+    return "regenerate"
+
+# ============================================================================
+# GRAPH ASSEMBLY
+# Wires nodes and edges into a compiled state machine. The conditional edge
+# out of validate is what makes this a graph with a loop, not a linear chain.
+# ============================================================================
+def build_graph():
+    """Wire the nodes and edges into a compiled LangGraph state machine.
+
+    Linear spine: objectives -> outline -> content -> assessment -> validate.
+    Then a conditional edge out of validate that either finishes, loops back to
+    objectives (regenerate), or finishes with failures recorded (escalate).
+    That loop back is what makes this a graph rather than a chain.
+    """
+    graph = StateGraph(CourseState)
+
+    # Register each node under a name.
+    graph.add_node("objectives", objectives_node)
+    graph.add_node("outline", outline_node)
+    graph.add_node("content", content_node)
+    graph.add_node("assessment", assessment_node)
+    graph.add_node("validate", validate_node)
+
+    # The linear spine: each node flows to the next, unconditionally.
+    graph.add_edge(START, "objectives")
+    graph.add_edge("objectives", "outline")
+    graph.add_edge("outline", "content")
+    graph.add_edge("content", "assessment")
+    graph.add_edge("assessment", "validate")
+
+    # The conditional edge: after validate, route_after_validation decides.
+    # The dict maps each string the router can return to a destination.
+    # "regenerate" points back to "objectives", creating the loop.
+    # "pass" and "escalate" both go to END, but for different reasons that
+    # the printed logs and the failures field make auditable.
+    graph.add_conditional_edges(
+        "validate",
+        route_after_validation,
+        {
+            "pass": END,
+            "escalate": END,
+            "regenerate": "objectives",
+        },
+    )
+
+    return graph.compile()
+
+# ============================================================================
+# ENTRY POINT / TEST HARNESS
+# Runs the full pipeline end to end from a single graph.invoke() call.
+# Ingestion runs once up front (the source is fixed); LangGraph then
+# orchestrates objectives -> outline -> content -> assessment -> validate,
+# including the regeneration loop, from one call.
+# ============================================================================
 if __name__ == "__main__":
+    # Build the extracted, chunked document once. Ingestion is not part of the
+    # loop (the source does not change), so it runs before the graph.
     text = extract_text(SOURCE_PATH)
     chunks = chunk_text(text)
-    state: CourseState = {
+
+    # Initial state. The generation fields start empty; the loop fields start
+    # at their base values. LangGraph fills the rest as nodes run.
+    initial_state: CourseState = {
         "source_text": text,
         "chunks": chunks,
         "objectives": "",
         "outline": "",
         "content": "",
         "assessment": "",
+        "failures": [],
+        "attempts": 0,
     }
 
-    # Run the four nodes in sequence, threading state manually for now.
-    # This mimics what the LangGraph runtime will do automatically once the
-    # graph is wired: each node's return dict updates the shared state.
-    state.update(objectives_node(state))
-    state.update(outline_node(state))
-    state.update(content_node(state))
-    state.update(assessment_node(state))
+    # Build the graph and run it. This single invoke replaces the four manual
+    # state.update calls from before: LangGraph now orchestrates the whole
+    # pipeline, including the validation loop, from one call.
+    app = build_graph()
+    final_state = app.invoke(initial_state)
 
-    print("----- OBJECTIVES -----\n")
-    print(state["objectives"])
-    print("\n----- OUTLINE -----\n")
-    print(state["outline"])
-    print("\n----- CONTENT -----\n")
-    print(state["content"])
+    print("\n========== FINAL RESULT ==========")
+    print(f"Attempts: {final_state['attempts']}")
+    print(f"Remaining failures: {final_state['failures']}")
+    print("\n----- OBJECTIVES -----\n")
+    print(final_state["objectives"])
     print("\n----- ASSESSMENT (GIFT) -----\n")
-    print(state["assessment"])
+    print(final_state["assessment"])
