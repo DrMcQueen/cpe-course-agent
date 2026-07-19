@@ -136,6 +136,33 @@ def content_node(state: CourseState) -> dict:
     # (ASSESSMENT, and later the validator) read this combined content.
     return {"content": "\n\n".join(module_contents)}
 
+def assessment_node(state: CourseState) -> dict:
+    """ASSESSMENT: write GIFT-format quiz questions aligned to the objectives.
+
+    Reads BOTH objectives and content. This dual input is the alignment
+    mechanism: questions are written to test the objectives (what the learner
+    should be able to do) using material from the content (what was taught).
+    Assessing objectives rather than arbitrary facts is a core instructional
+    design principle, and it makes the output checkable: each question should
+    trace to an objective.
+
+    Output is Moodle GIFT format so questions import directly into a live LMS
+    question bank with no manual reformatting. This makes the assessment the
+    most concretely validatable node: GIFT is either syntactically valid or it
+    is not, and question count either matches the objective count or it does not.
+    """
+    system_prompt = load_prompt("assessment")
+
+    time.sleep(4)
+
+    response = llm.invoke(
+        f"{system_prompt}\n\n"
+        f"--- LEARNING OBJECTIVES ---\n\n{state['objectives']}\n\n"
+        f"--- INSTRUCTIONAL CONTENT ---\n\n{state['content']}"
+    )
+
+    return {"assessment": response.text}
+
 # Test Harness
 if __name__ == "__main__":
     text = extract_text(SOURCE_PATH)
@@ -149,12 +176,13 @@ if __name__ == "__main__":
         "assessment": "",
     }
 
-    # Run the three nodes in sequence, threading state manually for now.
+    # Run the four nodes in sequence, threading state manually for now.
     # This mimics what the LangGraph runtime will do automatically once the
     # graph is wired: each node's return dict updates the shared state.
     state.update(objectives_node(state))
     state.update(outline_node(state))
     state.update(content_node(state))
+    state.update(assessment_node(state))
 
     print("----- OBJECTIVES -----\n")
     print(state["objectives"])
@@ -162,3 +190,5 @@ if __name__ == "__main__":
     print(state["outline"])
     print("\n----- CONTENT -----\n")
     print(state["content"])
+    print("\n----- ASSESSMENT (GIFT) -----\n")
+    print(state["assessment"])
