@@ -74,8 +74,69 @@ def objectives_node(state: CourseState) -> dict:
     # and .text is the accessor that flattens it to a plain string.
     return {"objectives": response.text}
 
-# Standalone test: run just the ingestion + objectives path and print the
-# result, before the full graph is wired. Verifies this node in isolation.
+def outline_node(state: CourseState) -> dict:
+    """OUTLINE: design the course structure from the learning objectives.
+
+    Unlike OBJECTIVES, this node reads a previous node's output
+    (state["objectives"]), not the raw document. The course structure should
+    follow from the objectives, so the outline is grounded in them rather than
+    re-derived from source text. This is the pipeline building on itself.
+    """
+    system_prompt = load_prompt("outline")
+
+    time.sleep(4)
+
+    response = llm.invoke(
+        f"{system_prompt}\n\n--- LEARNING OBJECTIVES ---\n\n{state['objectives']}"
+    )
+
+    return {"outline": response.text}
+
+def content_node(state: CourseState) -> dict:
+    """CONTENT: write instructional text for each module, one call per module.
+
+    Design decision (looping): earlier this generated all modules in a single
+    call. Switched to one call per module so each module gets focused, richer
+    content (200-250 words) and so a weak result in one module does not drag
+    down the others. This mirrors how a production pipeline isolates module
+    generation. Tradeoff: more API calls per run and a slower pass.
+
+    Design decision (length): raised from ~150 to 200-250 words per module so
+    there is enough substance for assessment items to visibly align to what the
+    module actually taught. Alignment is the thing the proof of concept must
+    show, and it is invisible if the content is thin.
+    """
+    system_prompt = load_prompt("content")
+
+    # The outline is one text block containing all modules. We split it into
+    # individual modules so each can be sent to the model on its own. Modules
+    # are separated by blank lines in the outline's output format, so a blank
+    # line is the split point. We filter out any empty fragments left by the
+    # split so we do not send the model an empty module.
+    module_blocks = [
+        block.strip()
+        for block in state["outline"].split("\n\n")
+        if block.strip()
+    ]
+
+    # Generate content module by module, collecting each result. Using a list
+    # and joining at the end (rather than string concatenation in the loop) is
+    # the standard Python approach: clearer and avoids repeated recopying.
+    module_contents = []
+    for i, module in enumerate(module_blocks, start=1):
+        time.sleep(4)  # rate-limit spacing, one pause per call now
+        response = llm.invoke(
+            f"{system_prompt}\n\n--- MODULE ---\n\n{module}"
+        )
+        # Re-attach a clean heading so the assembled content is readable and so
+        # downstream nodes and export can tell modules apart.
+        module_contents.append(f"## Module {i}\n\n{response.text}")
+
+    # Join all module contents into one block for the state. Downstream nodes
+    # (ASSESSMENT, and later the validator) read this combined content.
+    return {"content": "\n\n".join(module_contents)}
+
+# Test Harness
 if __name__ == "__main__":
     text = extract_text(SOURCE_PATH)
     chunks = chunk_text(text)
@@ -87,6 +148,17 @@ if __name__ == "__main__":
         "content": "",
         "assessment": "",
     }
-    result = objectives_node(state)
-    print("----- EXTRACTED OBJECTIVES -----\n")
-    print(result["objectives"])
+
+    # Run the three nodes in sequence, threading state manually for now.
+    # This mimics what the LangGraph runtime will do automatically once the
+    # graph is wired: each node's return dict updates the shared state.
+    state.update(objectives_node(state))
+    state.update(outline_node(state))
+    state.update(content_node(state))
+
+    print("----- OBJECTIVES -----\n")
+    print(state["objectives"])
+    print("\n----- OUTLINE -----\n")
+    print(state["outline"])
+    print("\n----- CONTENT -----\n")
+    print(state["content"])
